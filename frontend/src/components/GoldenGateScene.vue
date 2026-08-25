@@ -1,9 +1,16 @@
 <script setup lang="ts">
-import { onMounted, onBeforeUnmount, ref } from 'vue';
+import { onMounted, onBeforeUnmount, ref, watch } from 'vue';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { Water } from 'three/examples/jsm/objects/Water.js';
 import { Sky } from 'three/examples/jsm/objects/Sky.js';
+import { CameraDirector } from '../scene/cameraDirector';
+import {
+  environmentState,
+  cameraState,
+  bridgeStats,
+  registerExportHandler,
+} from '../scene/sceneState';
 
 const canvasContainer = ref<HTMLDivElement | null>(null);
 
@@ -12,6 +19,11 @@ const BRIDGE_COLOR = 0xF04A00; // International Orange
 const ROAD_COLOR = 0x333333;
 const CABLE_COLOR = 0xF04A00;
 
+const DAY_FOG_COLOR = 0xefd1b5;
+const NIGHT_FOG_COLOR = 0x0a0f1e;
+/** 夜晚模式下压到海平面以下的太阳高度角（度） */
+const NIGHT_SUN_ELEVATION = -8;
+
 let scene: THREE.Scene;
 let camera: THREE.PerspectiveCamera;
 let renderer: THREE.WebGLRenderer;
@@ -19,6 +31,15 @@ let controls: OrbitControls;
 let water: Water;
 let sun: THREE.Vector3;
 let animationId: number;
+let sky: Sky;
+let pmremGenerator: THREE.PMREMGenerator;
+let sceneEnv: THREE.Scene;
+let envRenderTarget: THREE.WebGLRenderTarget | null = null;
+let ambientLight: THREE.AmbientLight;
+let dirLight: THREE.DirectionalLight;
+let nightLights: THREE.PointLight[] = [];
+let cameraDirector: CameraDirector;
+const clock = new THREE.Clock();
 
 // Cleanup helper
 const cleanUp = () => {
@@ -89,7 +110,7 @@ const init = () => {
 
   // 5. Sun & Sky
   sun = new THREE.Vector3();
-  const sky = new Sky();
+  sky = new Sky();
   sky.scale.setScalar(10000);
   scene.add(sky);
 
@@ -99,27 +120,11 @@ const init = () => {
   skyUniforms['mieCoefficient']!.value = 0.005;
   skyUniforms['mieDirectionalG']!.value = 0.8;
 
-  const pmremGenerator = new THREE.PMREMGenerator(renderer);
-  const sceneEnv = new THREE.Scene();
-  let renderTarget: THREE.WebGLRenderTarget;
+  pmremGenerator = new THREE.PMREMGenerator(renderer);
+  sceneEnv = new THREE.Scene();
 
-  const updateSun = () => {
-    const theta = Math.PI * (0.45 - 0.5); // Elevation
-    const phi = 2 * Math.PI * (0.25 - 0.5); // Azimuth
-
-    sun.x = Math.cos(phi);
-    sun.y = Math.sin(phi) * Math.sin(theta);
-    sun.z = Math.sin(phi) * Math.cos(theta);
-
-    (sky.material as THREE.ShaderMaterial).uniforms['sunPosition']!.value.copy(sun);
-
-    if (renderTarget) renderTarget.dispose();
-    sceneEnv.add(sky);
-    renderTarget = pmremGenerator.fromScene(sceneEnv);
-    scene.add(sky);
-    scene.environment = renderTarget.texture;
-  };
-  updateSun();
+  // 高度角 9°、方位角 180° 与原场景初始太阳方向完全一致
+  applySunPosition(environmentState.sunElevation, environmentState.sunAzimuth);
 
   // 6. Water
   const waterGeometry = new THREE.PlaneGeometry(10000, 10000);
@@ -140,24 +145,80 @@ const init = () => {
   scene.add(water);
 
   // 7. Lighting (Atmospheric)
-  const ambientLight = new THREE.AmbientLight(0xcccccc, 0.4);
+  ambientLight = new THREE.AmbientLight(0xcccccc, 0.4);
   scene.add(ambientLight);
 
-  const dirLight = new THREE.DirectionalLight(0xffaa33, 1);
+  dirLight = new THREE.DirectionalLight(0xffaa33, 1);
   dirLight.position.set(-1, 1, 1);
   scene.add(dirLight);
 
   // Fog for depth
-  scene.fog = new THREE.FogExp2(0xefd1b5, 0.0015); // Matches the sunset-ish vibe
+  scene.fog = new THREE.FogExp2(DAY_FOG_COLOR, environmentState.fogDensity); // Matches the sunset-ish vibe
 
   // 8. Build The Bridge
   buildBridge();
+
+  // 9. Camera Director (flight views)
+  cameraDirector = new CameraDirector(camera, controls);
 
   // Event Listeners
   window.addEventListener('resize', onWindowResize);
 
   // Start Loop
   animate();
+};
+
+/** 根据高度角/方位角更新太阳方向、天空与环境贴图 */
+const applySunPosition = (elevationDeg: number, azimuthDeg: number) => {
+  const phi = THREE.MathUtils.degToRad(90 - elevationDeg);
+  const theta = THREE.MathUtils.degToRad(azimuthDeg);
+  sun.setFromSphericalCoords(1, phi, theta);
+
+  (sky.material as THREE.ShaderMaterial).uniforms['sunPosition']!.value.copy(sun);
+
+  if (envRenderTarget) envRenderTarget.dispose();
+  sceneEnv.add(sky);
+  envRenderTarget = pmremGenerator.fromScene(sceneEnv);
+  scene.add(sky);
+  scene.environment = envRenderTarget.texture;
+};
+
+/** 将控制面板的环境状态实时应用到场景 */
+const applyEnvironment = () => {
+  const env = environmentState;
+  applySunPosition(env.isNight ? NIGHT_SUN_ELEVATION : env.sunElevation, env.sunAzimuth);
+
+  // 水面阳光反射方向跟随太阳
+  const waterUniforms = (water.material as THREE.ShaderMaterial).uniforms;
+  waterUniforms['sunDirection']!.value.copy(sun).normalize();
+  waterUniforms['distortionScale']!.value = env.waveIntensity;
+
+  // 雾气
+  const fog = scene.fog as THREE.FogExp2;
+  fog.density = env.fogDensity;
+  fog.color.setHex(env.isNight ? NIGHT_FOG_COLOR : DAY_FOG_COLOR);
+
+  // 曝光
+  renderer.toneMappingExposure = env.exposure;
+
+  // 昼夜光照
+  ambientLight.intensity = env.isNight ? 0.08 : 0.4;
+  ambientLight.color.setHex(env.isNight ? 0x334466 : 0xcccccc);
+  dirLight.intensity = env.isNight ? 0.05 : 1;
+  dirLight.position.copy(sun).multiplyScalar(100);
+  nightLights.forEach((light) => {
+    light.intensity = env.isNight ? 800 : 0;
+  });
+};
+
+/** 渲染当前帧并导出为 PNG 图片 */
+const exportScene = () => {
+  renderer.render(scene, camera);
+  const dataUrl = renderer.domElement.toDataURL('image/png');
+  const link = document.createElement('a');
+  link.href = dataUrl;
+  link.download = `golden-gate-${Date.now()}.png`;
+  link.click();
 };
 
 const buildBridge = () => {
@@ -308,19 +369,56 @@ const buildBridge = () => {
   });
 
   bridgeGroup.add(suspenderMesh);
+
+  // --- Night Lights (默认关闭，不影响默认效果；夜晚模式开启) ---
+  nightLights = [];
+  for (let i = 0; i < 6; i++) {
+    const x = -totalLength / 2 + (totalLength / 5) * i;
+    const light = new THREE.PointLight(0xffcc66, 0, 220);
+    light.position.set(x, deckY + 10, 0);
+    scene.add(light);
+    nightLights.push(light);
+  }
+
+  // --- Bridge Stats (供控制面板实时显示) ---
+  let cableLength = 0;
+  for (let i = 1; i < leftCablePoints.length; i++) {
+    cableLength += leftCablePoints[i]!.distanceTo(leftCablePoints[i - 1]!);
+  }
+  bridgeStats.towerHeight = towerHeight;
+  bridgeStats.mainSpan = span;
+  bridgeStats.sideSpan = sideSpan;
+  bridgeStats.totalLength = totalLength;
+  bridgeStats.deckHeight = deckY;
+  bridgeStats.deckWidth = 34;
+  bridgeStats.cableLength = Math.round(cableLength);
+  bridgeStats.suspenderCount = idx;
 };
 
 const animate = () => {
   animationId = requestAnimationFrame(animate);
+  const delta = clock.getDelta();
   if (water) {
     (water.material as THREE.ShaderMaterial).uniforms['time']!.value += 1.0 / 60.0;
   }
-  controls.update();
+  if (cameraDirector.isFreeMode) {
+    controls.update();
+  } else {
+    cameraDirector.update(delta);
+  }
   renderer.render(scene, camera);
 };
 
 onMounted(() => {
   init();
+  registerExportHandler(exportScene);
+  // 环境参数变化即时生效
+  watch(environmentState, applyEnvironment, { deep: true });
+  // 相机模式一键切换
+  watch(
+    () => cameraState.mode,
+    (mode) => cameraDirector.setMode(mode),
+  );
 });
 
 onBeforeUnmount(() => {
