@@ -1,341 +1,256 @@
 <script setup lang="ts">
-import { onMounted, onBeforeUnmount, ref } from 'vue';
-import * as THREE from 'three';
-import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { Water } from 'three/examples/jsm/objects/Water.js';
-import { Sky } from 'three/examples/jsm/objects/Sky.js';
+import { onMounted, onBeforeUnmount, ref, reactive } from 'vue';
+import { BridgeSceneController, DEFAULT_ENVIRONMENT } from '../scene/bridgeSceneController';
+import type {
+  EnvironmentParams,
+  TimeOfDayPreset,
+  CameraViewId,
+  CameraViewInfo,
+  BridgeStats,
+  LiveStats,
+} from '../scene/bridgeSceneController';
 
-const canvasContainer = ref<HTMLDivElement | null>(null);
-
-// Configuration
-const BRIDGE_COLOR = 0xF04A00; // International Orange
-const ROAD_COLOR = 0x333333;
-const CABLE_COLOR = 0xF04A00;
-
-let scene: THREE.Scene;
-let camera: THREE.PerspectiveCamera;
-let renderer: THREE.WebGLRenderer;
-let controls: OrbitControls;
-let water: Water;
-let sun: THREE.Vector3;
-let animationId: number;
-
-// Cleanup helper
-const cleanUp = () => {
-  if (animationId) cancelAnimationFrame(animationId);
-  if (renderer) renderer.dispose();
-  if (controls) controls.dispose();
-  window.removeEventListener('resize', onWindowResize);
-};
-
-const onWindowResize = () => {
-  if (!camera || !renderer) return;
-  camera.aspect = window.innerWidth / window.innerHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
-};
-
-// Generate a noise texture for water normals
-function createWaterNormals(): THREE.Texture {
-  const canvas = document.createElement('canvas');
-  canvas.width = 512;
-  canvas.height = 512;
-  const context = canvas.getContext('2d');
-  if (context) {
-    context.fillStyle = '#8080ff'; // Default normal blue
-    context.fillRect(0, 0, 512, 512);
-    // Add some random noise
-    for (let i = 0; i < 20000; i++) {
-        const x = Math.random() * 512;
-        const y = Math.random() * 512;
-        const r = Math.random() * 255;
-        const g = Math.random() * 255;
-        // Simple noise approximation for ripples
-        context.fillStyle = `rgb(${r}, ${g}, 255)`;
-        context.fillRect(x, y, 2, 2);
-    }
-  }
-  const texture = new THREE.CanvasTexture(canvas);
-  texture.wrapS = THREE.RepeatWrapping;
-  texture.wrapT = THREE.RepeatWrapping;
-  return texture;
+interface SliderConfig {
+  key: keyof EnvironmentParams;
+  label: string;
+  min: number;
+  max: number;
+  step: number;
+  format: (value: number) => string;
 }
 
-const init = () => {
-  if (!canvasContainer.value) return;
+const TIME_PRESETS: { id: TimeOfDayPreset; label: string }[] = [
+  { id: 'night', label: '夜晚' },
+  { id: 'dusk', label: '黄昏' },
+  { id: 'day', label: '白天' },
+];
 
-  // 1. Scene Setup
-  scene = new THREE.Scene();
-  
-  // 2. Camera
-  camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 1, 20000);
-  camera.position.set(30, 30, 100);
+const SLIDERS: SliderConfig[] = [
+  {
+    key: 'sunElevation',
+    label: '太阳高度',
+    min: -20,
+    max: 90,
+    step: 1,
+    format: (v) => `${v.toFixed(0)}°`,
+  },
+  {
+    key: 'sunAzimuth',
+    label: '太阳方位',
+    min: 0,
+    max: 360,
+    step: 1,
+    format: (v) => `${v.toFixed(0)}°`,
+  },
+  {
+    key: 'fogDensity',
+    label: '雾气浓度',
+    min: 0,
+    max: 0.006,
+    step: 0.0001,
+    format: (v) => (v * 1000).toFixed(2),
+  },
+  {
+    key: 'waveStrength',
+    label: '海洋波纹',
+    min: 0,
+    max: 8,
+    step: 0.1,
+    format: (v) => v.toFixed(1),
+  },
+  {
+    key: 'exposure',
+    label: '画面曝光',
+    min: 0,
+    max: 2,
+    step: 0.05,
+    format: (v) => v.toFixed(2),
+  },
+];
 
-  // 3. Renderer
-  renderer = new THREE.WebGLRenderer({ antialias: true });
-  renderer.setPixelRatio(window.devicePixelRatio);
-  renderer.setSize(window.innerWidth, window.innerHeight);
-  renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 0.5;
-  canvasContainer.value.appendChild(renderer.domElement);
+const canvasContainer = ref<HTMLDivElement | null>(null);
+const panelOpen = ref(true);
 
-  // 4. Controls
-  controls = new OrbitControls(camera, renderer.domElement);
-  controls.maxPolarAngle = Math.PI * 0.495;
-  controls.target.set(0, 10, 0);
-  controls.minDistance = 40.0;
-  controls.maxDistance = 2000.0;
-  controls.update();
+const env = reactive<EnvironmentParams>({ ...DEFAULT_ENVIRONMENT });
+const views = ref<CameraViewInfo[]>([]);
+const stats = ref<BridgeStats | null>(null);
+const live = ref<LiveStats>({
+  fps: 0,
+  cameraX: 0,
+  cameraY: 0,
+  cameraZ: 0,
+  viewId: 'free',
+});
 
-  // 5. Sun & Sky
-  sun = new THREE.Vector3();
-  const sky = new Sky();
-  sky.scale.setScalar(10000);
-  scene.add(sky);
+let controller: BridgeSceneController | null = null;
+let statsTimer: ReturnType<typeof setInterval> | null = null;
 
-  const skyUniforms = (sky.material as THREE.ShaderMaterial).uniforms;
-  skyUniforms['turbidity']!.value = 10;
-  skyUniforms['rayleigh']!.value = 2;
-  skyUniforms['mieCoefficient']!.value = 0.005;
-  skyUniforms['mieDirectionalG']!.value = 0.8;
-
-  const pmremGenerator = new THREE.PMREMGenerator(renderer);
-  const sceneEnv = new THREE.Scene();
-  let renderTarget: THREE.WebGLRenderTarget;
-
-  const updateSun = () => {
-    const theta = Math.PI * (0.45 - 0.5); // Elevation
-    const phi = 2 * Math.PI * (0.25 - 0.5); // Azimuth
-
-    sun.x = Math.cos(phi);
-    sun.y = Math.sin(phi) * Math.sin(theta);
-    sun.z = Math.sin(phi) * Math.cos(theta);
-
-    (sky.material as THREE.ShaderMaterial).uniforms['sunPosition']!.value.copy(sun);
-
-    if (renderTarget) renderTarget.dispose();
-    sceneEnv.add(sky);
-    renderTarget = pmremGenerator.fromScene(sceneEnv);
-    scene.add(sky);
-    scene.environment = renderTarget.texture;
-  };
-  updateSun();
-
-  // 6. Water
-  const waterGeometry = new THREE.PlaneGeometry(10000, 10000);
-  water = new Water(
-    waterGeometry,
-    {
-      textureWidth: 512,
-      textureHeight: 512,
-      waterNormals: createWaterNormals(),
-      sunDirection: new THREE.Vector3(),
-      sunColor: 0xffffff,
-      waterColor: 0x001e0f,
-      distortionScale: 3.7,
-      fog: scene.fog !== undefined
-    }
-  );
-  water.rotation.x = -Math.PI / 2;
-  scene.add(water);
-
-  // 7. Lighting (Atmospheric)
-  const ambientLight = new THREE.AmbientLight(0xcccccc, 0.4);
-  scene.add(ambientLight);
-
-  const dirLight = new THREE.DirectionalLight(0xffaa33, 1);
-  dirLight.position.set(-1, 1, 1);
-  scene.add(dirLight);
-
-  // Fog for depth
-  scene.fog = new THREE.FogExp2(0xefd1b5, 0.0015); // Matches the sunset-ish vibe
-
-  // 8. Build The Bridge
-  buildBridge();
-
-  // Event Listeners
-  window.addEventListener('resize', onWindowResize);
-
-  // Start Loop
-  animate();
+const syncEnvironment = (): void => {
+  controller?.updateEnvironment({ ...env });
 };
 
-const buildBridge = () => {
-  const bridgeGroup = new THREE.Group();
-  scene.add(bridgeGroup);
-
-  const towerMat = new THREE.MeshStandardMaterial({ 
-    color: BRIDGE_COLOR,
-    roughness: 0.7,
-    metalness: 0.1
-  });
-  
-  const roadMat = new THREE.MeshStandardMaterial({ 
-    color: ROAD_COLOR,
-    roughness: 0.9 
-  });
-
-  const cableMat = new THREE.MeshStandardMaterial({ 
-    color: CABLE_COLOR,
-    roughness: 0.5,
-    metalness: 0.2
-  });
-
-  // --- Dimensions (Approximate Scaled) ---
-  const towerHeight = 100; // Above water
-  const towerWidth = 10;
-  const towerDepth = 6;
-  const span = 400; // Distance between towers
-  const sideSpan = 150;
-  const deckY = 25; // Height of deck above water
-
-  // --- Helper: Create Tower ---
-  const createTower = (x: number) => {
-    const towerGroup = new THREE.Group();
-    towerGroup.position.set(x, 0, 0);
-
-    // Two legs
-    const legGeo = new THREE.BoxGeometry(towerWidth, towerHeight, towerDepth);
-    const legLeft = new THREE.Mesh(legGeo, towerMat);
-    legLeft.position.set(0, towerHeight / 2, 15);
-    legLeft.castShadow = true;
-    legLeft.receiveShadow = true;
-
-    const legRight = new THREE.Mesh(legGeo, towerMat);
-    legRight.position.set(0, towerHeight / 2, -15);
-    legRight.castShadow = true;
-    legRight.receiveShadow = true;
-
-    // Cross braces (Art Deco style)
-    const braceGeo = new THREE.BoxGeometry(towerWidth - 2, 4, 30);
-    const brace1 = new THREE.Mesh(braceGeo, towerMat);
-    brace1.position.set(0, towerHeight * 0.9, 0);
-    
-    const brace2 = new THREE.Mesh(braceGeo, towerMat);
-    brace2.position.set(0, towerHeight * 0.7, 0);
-
-    const brace3 = new THREE.Mesh(braceGeo, towerMat);
-    brace3.position.set(0, towerHeight * 0.5, 0);
-
-    const brace4 = new THREE.Mesh(braceGeo, towerMat);
-    brace4.position.set(0, deckY + 5, 0); // Below deck
-
-    // Decorative top
-    const topGeo = new THREE.BoxGeometry(towerWidth - 2, 10, towerDepth - 2);
-    const topLeft = new THREE.Mesh(topGeo, towerMat);
-    topLeft.position.set(0, towerHeight + 5, 15);
-    const topRight = new THREE.Mesh(topGeo, towerMat);
-    topRight.position.set(0, towerHeight + 5, -15);
-
-    towerGroup.add(legLeft, legRight, brace1, brace2, brace3, brace4, topLeft, topRight);
-    return towerGroup;
-  };
-
-  const tower1 = createTower(-span / 2);
-  const tower2 = createTower(span / 2);
-  bridgeGroup.add(tower1, tower2);
-
-  // --- Deck ---
-  const totalLength = span + (sideSpan * 2);
-  const deckGeo = new THREE.BoxGeometry(totalLength, 2, 34); // Wide deck
-  const deck = new THREE.Mesh(deckGeo, roadMat);
-  deck.position.set(0, deckY, 0);
-  deck.receiveShadow = true;
-  bridgeGroup.add(deck);
-
-  // --- Main Cables (Catenary) ---
-  // Using quadratic curves to simulate catenary
-  const createMainCable = (zOffset: number) => {
-    // Left Side Span
-    const curve1 = new THREE.QuadraticBezierCurve3(
-      new THREE.Vector3(-span/2 - sideSpan, deckY, zOffset),
-      new THREE.Vector3(-span/2 - sideSpan/2, deckY + (towerHeight - deckY)/2, zOffset), // Control point
-      new THREE.Vector3(-span/2, towerHeight, zOffset)
-    );
-
-    // Center Span (The deep curve)
-    const curve2 = new THREE.QuadraticBezierCurve3(
-      new THREE.Vector3(-span/2, towerHeight, zOffset),
-      new THREE.Vector3(0, deckY + 5, zOffset), // Low point
-      new THREE.Vector3(span/2, towerHeight, zOffset)
-    );
-
-    // Right Side Span
-    const curve3 = new THREE.QuadraticBezierCurve3(
-      new THREE.Vector3(span/2, towerHeight, zOffset),
-      new THREE.Vector3(span/2 + sideSpan/2, deckY + (towerHeight - deckY)/2, zOffset),
-      new THREE.Vector3(span/2 + sideSpan, deckY, zOffset)
-    );
-
-    const points = [
-        ...curve1.getPoints(20),
-        ...curve2.getPoints(50),
-        ...curve3.getPoints(20)
-    ];
-
-    const curvePath = new THREE.CatmullRomCurve3(points);
-    const tubeGeo = new THREE.TubeGeometry(curvePath, 100, 1.5, 8, false);
-    const cableMesh = new THREE.Mesh(tubeGeo, cableMat);
-    bridgeGroup.add(cableMesh);
-
-    return points;
-  };
-
-  const leftCablePoints = createMainCable(15);
-  const rightCablePoints = createMainCable(-15);
-
-  // --- Vertical Suspenders (InstancedMesh for performance) ---
-  // We place a vertical line from the cable point down to the deck
-  // Only for the middle span mostly, and parts of side spans
-  const suspenderCount = leftCablePoints.length + rightCablePoints.length;
-  const suspenderGeo = new THREE.CylinderGeometry(0.3, 0.3, 1, 8);
-  const suspenderMesh = new THREE.InstancedMesh(suspenderGeo, cableMat, suspenderCount);
-  
-  const dummy = new THREE.Object3D();
-  let idx = 0;
-
-  [leftCablePoints, rightCablePoints].forEach(points => {
-    points.forEach((p) => {
-        // Only add suspenders if the point is above the deck significantly
-        if (p.y > deckY + 2) {
-            const height = p.y - deckY;
-            dummy.position.set(p.x, deckY + height / 2, p.z);
-            dummy.scale.set(1, height, 1);
-            dummy.updateMatrix();
-            suspenderMesh.setMatrixAt(idx++, dummy.matrix);
-        }
-    });
-  });
-
-  bridgeGroup.add(suspenderMesh);
+const applyTimeOfDay = (preset: TimeOfDayPreset): void => {
+  if (!controller) return;
+  Object.assign(env, controller.applyTimeOfDay(preset));
 };
 
-const animate = () => {
-  animationId = requestAnimationFrame(animate);
-  if (water) {
-    (water.material as THREE.ShaderMaterial).uniforms['time']!.value += 1.0 / 60.0;
-  }
-  controls.update();
-  renderer.render(scene, camera);
+const flyTo = (id: CameraViewId): void => {
+  controller?.flyToView(id);
+};
+
+const activePreset = (): TimeOfDayPreset => {
+  if (env.dayNight <= 0.25) return 'night';
+  if (env.dayNight >= 0.75) return 'day';
+  return 'dusk';
+};
+
+const viewLabel = (id: CameraViewId | 'free'): string => {
+  if (id === 'free') return '自由视角';
+  return views.value.find((v) => v.id === id)?.label ?? id;
+};
+
+const exportImage = (): void => {
+  if (!controller) return;
+  const dataUrl = controller.captureImage();
+  const link = document.createElement('a');
+  const now = new Date();
+  const pad = (n: number): string => String(n).padStart(2, '0');
+  link.download = `golden-gate-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(
+    now.getDate(),
+  )}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.png`;
+  link.href = dataUrl;
+  link.click();
 };
 
 onMounted(() => {
-  init();
+  if (!canvasContainer.value) return;
+  controller = new BridgeSceneController(canvasContainer.value);
+  views.value = controller.getCameraViews();
+  stats.value = controller.getBridgeStats();
+  statsTimer = setInterval(() => {
+    if (controller) live.value = controller.getLiveStats();
+  }, 400);
 });
 
 onBeforeUnmount(() => {
-  cleanUp();
+  if (statsTimer !== null) clearInterval(statsTimer);
+  statsTimer = null;
+  controller?.dispose();
+  controller = null;
 });
 </script>
 
 <template>
-  <div ref="canvasContainer" class="canvas-container"></div>
-  <div class="overlay">
-    <h1>金门大桥</h1>
+  <div class="scene-root">
+    <div ref="canvasContainer" class="canvas-container"></div>
+
+    <div class="overlay">
+      <h1>金门大桥</h1>
+      <p>Golden Gate Bridge · 3D 交互场景</p>
+    </div>
+
+    <button
+      class="panel-toggle"
+      type="button"
+      :class="{ collapsed: !panelOpen }"
+      @click="panelOpen = !panelOpen"
+    >
+      {{ panelOpen ? '隐藏面板 ×' : '控制面板 ☰' }}
+    </button>
+
+    <aside v-show="panelOpen" class="control-panel">
+      <section class="panel-section">
+        <h2>环境控制</h2>
+
+        <div class="preset-row">
+          <button
+            v-for="preset in TIME_PRESETS"
+            :key="preset.id"
+            type="button"
+            class="preset-btn"
+            :class="{ active: activePreset() === preset.id }"
+            @click="applyTimeOfDay(preset.id)"
+          >
+            {{ preset.label }}
+          </button>
+        </div>
+
+        <div v-for="slider in SLIDERS" :key="slider.key" class="slider-row">
+          <label>
+            <span>{{ slider.label }}</span>
+            <span class="slider-value">{{ slider.format(env[slider.key]) }}</span>
+          </label>
+          <input
+            type="range"
+            :min="slider.min"
+            :max="slider.max"
+            :step="slider.step"
+            v-model.number="env[slider.key]"
+            @input="syncEnvironment"
+          />
+        </div>
+      </section>
+
+      <section class="panel-section">
+        <h2>相机视角</h2>
+        <div class="view-grid">
+          <button
+            v-for="view in views"
+            :key="view.id"
+            type="button"
+            class="view-btn"
+            :class="{ active: live.viewId === view.id }"
+            @click="flyTo(view.id)"
+          >
+            {{ view.label }}
+          </button>
+        </div>
+        <p class="hint">飞行 / 环绕过程中拖拽画面即可随时中断，回到自由视角。</p>
+      </section>
+
+      <section class="panel-section">
+        <h2>桥体参数</h2>
+        <dl v-if="stats" class="stats-grid">
+          <div><dt>桥塔数量</dt><dd>{{ stats.towerCount }} 座</dd></div>
+          <div><dt>桥塔高度</dt><dd>{{ stats.towerHeight }} m</dd></div>
+          <div><dt>主跨长度</dt><dd>{{ stats.mainSpan }} m</dd></div>
+          <div><dt>边跨长度</dt><dd>{{ stats.sideSpan }} m × 2</dd></div>
+          <div><dt>桥梁全长</dt><dd>{{ stats.totalLength }} m</dd></div>
+          <div><dt>桥面宽度</dt><dd>{{ stats.deckWidth }} m</dd></div>
+          <div><dt>桥面距水面</dt><dd>{{ stats.deckHeight }} m</dd></div>
+          <div><dt>主缆数量</dt><dd>{{ stats.mainCableCount }} 根</dd></div>
+          <div><dt>垂直吊索</dt><dd>{{ stats.suspenderCount }} 根</dd></div>
+        </dl>
+        <dl class="stats-grid live-stats">
+          <div><dt>实时帧率</dt><dd>{{ live.fps }} FPS</dd></div>
+          <div>
+            <dt>相机坐标</dt>
+            <dd>
+              X {{ live.cameraX.toFixed(0) }} · Y {{ live.cameraY.toFixed(0) }} · Z
+              {{ live.cameraZ.toFixed(0) }}
+            </dd>
+          </div>
+          <div><dt>当前视角</dt><dd>{{ viewLabel(live.viewId) }}</dd></div>
+        </dl>
+      </section>
+
+      <section class="panel-section">
+        <button type="button" class="export-btn" @click="exportImage">
+          导出当前画面为图片 (PNG)
+        </button>
+      </section>
+    </aside>
   </div>
 </template>
 
 <style scoped>
+.scene-root {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+}
+
 .canvas-container {
   width: 100vw;
   height: 100vh;
@@ -352,7 +267,7 @@ onBeforeUnmount(() => {
   z-index: 2;
   color: white;
   font-family: 'Helvetica Neue', Arial, sans-serif;
-  text-shadow: 0 2px 4px rgba(0,0,0,0.8);
+  text-shadow: 0 2px 4px rgba(0, 0, 0, 0.8);
   pointer-events: none;
 }
 
@@ -361,5 +276,201 @@ onBeforeUnmount(() => {
   font-size: 2.5rem;
   letter-spacing: 2px;
   font-weight: 300;
+}
+
+.overlay p {
+  margin: 6px 0 0;
+  font-size: 0.9rem;
+  opacity: 0.75;
+  letter-spacing: 1px;
+}
+
+.panel-toggle {
+  position: absolute;
+  top: 18px;
+  right: 18px;
+  z-index: 4;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  background: rgba(20, 22, 28, 0.72);
+  color: #fff;
+  font-size: 0.85rem;
+  padding: 8px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+  backdrop-filter: blur(10px);
+  transition: background 0.2s ease;
+}
+
+.panel-toggle:hover {
+  background: rgba(240, 74, 0, 0.85);
+}
+
+.panel-toggle.collapsed {
+  right: 18px;
+}
+
+.control-panel {
+  position: absolute;
+  top: 60px;
+  right: 18px;
+  z-index: 3;
+  width: 290px;
+  max-height: calc(100vh - 90px);
+  overflow-y: auto;
+  padding: 16px;
+  border-radius: 14px;
+  background: rgba(20, 22, 28, 0.78);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: #e8e8ec;
+  font-family: 'Helvetica Neue', Arial, sans-serif;
+  font-size: 0.85rem;
+  backdrop-filter: blur(14px);
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.45);
+}
+
+.panel-section {
+  padding: 10px 0 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.panel-section:last-child {
+  border-bottom: none;
+  padding-bottom: 2px;
+}
+
+.panel-section h2 {
+  margin: 0 0 10px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 2px;
+  color: #f04a00;
+  text-transform: uppercase;
+}
+
+.preset-row {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.preset-btn,
+.view-btn {
+  flex: 1;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.06);
+  color: #e8e8ec;
+  font-size: 0.82rem;
+  padding: 7px 4px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.preset-btn:hover,
+.view-btn:hover {
+  border-color: rgba(240, 74, 0, 0.7);
+  color: #ff8a5c;
+}
+
+.preset-btn.active,
+.view-btn.active {
+  background: #f04a00;
+  border-color: #f04a00;
+  color: #fff;
+}
+
+.slider-row {
+  margin-bottom: 10px;
+}
+
+.slider-row label {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 4px;
+  font-size: 0.82rem;
+}
+
+.slider-value {
+  color: #ff8a5c;
+  font-variant-numeric: tabular-nums;
+}
+
+.slider-row input[type='range'] {
+  width: 100%;
+  accent-color: #f04a00;
+  cursor: pointer;
+}
+
+.view-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.hint {
+  margin: 8px 0 0;
+  font-size: 0.72rem;
+  color: rgba(255, 255, 255, 0.5);
+  line-height: 1.4;
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 10px;
+  margin: 0;
+}
+
+.stats-grid div {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 6px;
+  padding: 5px 8px;
+}
+
+.stats-grid dt {
+  color: rgba(255, 255, 255, 0.6);
+  margin: 0;
+}
+
+.stats-grid dd {
+  margin: 0;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: #fff;
+}
+
+.live-stats {
+  grid-template-columns: 1fr;
+  margin-top: 10px;
+}
+
+.live-stats div {
+  background: rgba(240, 74, 0, 0.12);
+}
+
+.export-btn {
+  width: 100%;
+  border: none;
+  background: #f04a00;
+  color: #fff;
+  font-size: 0.9rem;
+  font-weight: 600;
+  letter-spacing: 1px;
+  padding: 11px;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background 0.15s ease, transform 0.1s ease;
+}
+
+.export-btn:hover {
+  background: #ff5e1a;
+}
+
+.export-btn:active {
+  transform: scale(0.98);
 }
 </style>
